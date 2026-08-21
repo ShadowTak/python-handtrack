@@ -265,6 +265,9 @@ def apply_filter_to_full_frame(frame, filter_name, mask_person=None, frame_galax
 face_frame_counter = 0
 cached_faces = []      # list of (x1, y1, x2, y2)
 cached_age_labels = []  # list of "Age: 25 (18-25)"
+face_age_history = {}   # {face_id: [age1, age2, ...]} for smoothing
+face_id_counter = 0
+EMA_ALPHA = 0.3  # smoothing factor (lower = more stable, 0.1-0.3 recommended)
 
 while True:
     success, img = cap.read()
@@ -284,24 +287,79 @@ while True:
     results = landmarker.detect_for_video(mp_image, timestamp_ms)
 
     # ==================== INSIGHTFACE AGE DETECTION ====================
-    # Run every 4 frames for performance (InsightFace is heavier than mediapipe)
+    # Run every 8 frames for stability (less frequent = more stable age)
     face_frame_counter += 1
-    if face_frame_counter % 4 == 0 and not countdown_active:
+    if face_frame_counter % 8 == 0 and not countdown_active:
         try:
             faces = face_analyzer.get(img)
-            cached_faces = []
-            cached_age_labels = []
+            new_faces = []
+            new_age_labels = []
+            matched_ids = set()
+
             for face in faces:
                 bbox = face.bbox.astype(int)
                 x1 = max(0, bbox[0])
                 y1 = max(0, bbox[1])
                 x2 = min(w, bbox[2])
                 y2 = min(h, bbox[3])
-                if x2 > x1 and y2 > y1:
-                    cached_faces.append((x1, y1, x2, y2))
-                    age = int(face.age)
-                    gender = "M" if face.gender == 1 else "F"
-                    cached_age_labels.append(f"Age: {age} {get_age_label(age)} ({gender})")
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                # Try to match with existing face by IoU
+                best_id = None
+                best_iou = 0.3  # minimum IoU threshold
+                for fid, fdata in face_age_history.items():
+                    if fid in matched_ids:
+                        continue
+                    fx1, fy1, fx2, fy2 = fdata['bbox']
+                    # Calculate IoU
+                    ix1 = max(x1, fx1)
+                    iy1 = max(y1, fy1)
+                    ix2 = min(x2, fx2)
+                    iy2 = min(y2, fy2)
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    area1 = (x2 - x1) * (y2 - y1)
+                    area2 = (fx2 - fx1) * (fy2 - fy1)
+                    union = area1 + area2 - inter
+                    iou = inter / union if union > 0 else 0
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_id = fid
+
+                age_raw = int(face.age)
+                gender = "M" if face.gender == 1 else "F"
+
+                if best_id is not None:
+                    # Matched: apply EMA smoothing
+                    matched_ids.add(best_id)
+                    prev_age = face_age_history[best_id]['smoothed_age']
+                    smoothed = EMA_ALPHA * age_raw + (1 - EMA_ALPHA) * prev_age
+                    face_age_history[best_id]['smoothed_age'] = smoothed
+                    face_age_history[best_id]['bbox'] = (x1, y1, x2, y2)
+                    face_age_history[best_id]['gender'] = gender
+                    age_final = int(round(smoothed))
+                else:
+                    # New face: create entry
+                    face_id_counter += 1
+                    best_id = face_id_counter
+                    face_age_history[best_id] = {
+                        'smoothed_age': float(age_raw),
+                        'bbox': (x1, y1, x2, y2),
+                        'gender': gender
+                    }
+                    matched_ids.add(best_id)
+                    age_final = age_raw
+
+                new_faces.append((x1, y1, x2, y2))
+                new_age_labels.append(f"Age: {age_final} {get_age_label(age_final)} ({gender})")
+
+            # Remove unmatched faces (face disappeared)
+            for fid in list(face_age_history.keys()):
+                if fid not in matched_ids:
+                    del face_age_history[fid]
+
+            cached_faces = new_faces
+            cached_age_labels = new_age_labels
         except Exception as e:
             pass
 
